@@ -1,6 +1,5 @@
 ﻿using AutoMapper;
 using Microsoft.Extensions.Logging;
-using QMS.Application.Common;
 using QMS.Application.DTOs.Queue;
 using QMS.Application.Interfaces;
 using QMS.Core.Entities;
@@ -8,20 +7,29 @@ using QMS.Core.Interfaces;
 
 namespace QMS.Application.Services;
 
+/// <summary>
+/// Complete Queue Service with all business logic from BVBase
+/// </summary>
 public class QueueService : IQueueService
 {
     private readonly IUnitOfWork _unitOfWork;
     private readonly IMapper _mapper;
     private readonly ILogger<QueueService> _logger;
+    private readonly IQMSHelperService _helper;
+    private readonly IQMSCacheService _cacheService;
 
     public QueueService(
         IUnitOfWork unitOfWork,
         IMapper mapper,
-        ILogger<QueueService> logger)
+        ILogger<QueueService> logger,
+        IQMSHelperService helper,
+        IQMSCacheService cacheService)
     {
         _unitOfWork = unitOfWork;
         _mapper = mapper;
         _logger = logger;
+        _helper = helper;
+        _cacheService = cacheService;
     }
 
     #region Queue Management
@@ -103,7 +111,6 @@ public class QueueService : IQueueService
                 Miss = await _unitOfWork.QueueItems.CountByStateAsync(queueId, 3, targetDate)
             };
 
-            // Get done and cancelled from database (not in cache)
             var completedItems = await _unitOfWork.QueueItems.FindAsync(qi =>
                 qi.QUEUE_ID == queueId &&
                 qi.CREATEDATE == targetDate &&
@@ -111,9 +118,9 @@ public class QueueService : IQueueService
 
             statistics.Done = completedItems.Count(qi => qi.STATE == 2);
             statistics.Cancel = completedItems.Count(qi => qi.STATE == -1);
-            statistics.Total = statistics.Wait + statistics.Process + statistics.Done + statistics.Miss + statistics.Cancel;
+            statistics.Total = statistics.Wait + statistics.Process + statistics.Done +
+                              statistics.Miss + statistics.Cancel;
 
-            // Get processing item
             var processingItem = await _unitOfWork.QueueItems.GetProcessingItemAsync(queueId);
             statistics.ProcessingSequence = processingItem?.DISPLAYTEXT;
 
@@ -144,7 +151,11 @@ public class QueueService : IQueueService
         }
     }
 
-    public async Task<List<QueueItemDto>> GetQueueItemsAsync(int queueId, DateTime? date = null, int? state = null, int? limit = null)
+    public async Task<List<QueueItemDto>> GetQueueItemsAsync(
+        int queueId,
+        DateTime? date = null,
+        int? state = null,
+        int? limit = null)
     {
         try
         {
@@ -165,7 +176,10 @@ public class QueueService : IQueueService
         }
     }
 
-    public async Task<QueueItemDto?> FindQueueItemByPatientCodeAsync(int queueId, string patientCode, DateTime? date = null)
+    public async Task<QueueItemDto?> FindQueueItemByPatientCodeAsync(
+        int queueId,
+        string patientCode,
+        DateTime? date = null)
     {
         try
         {
@@ -180,7 +194,10 @@ public class QueueService : IQueueService
         }
     }
 
-    public async Task<QueueItemDto?> FindQueueItemByDisplayTextAsync(int queueId, string displayText, DateTime? date = null)
+    public async Task<QueueItemDto?> FindQueueItemByDisplayTextAsync(
+        int queueId,
+        string displayText,
+        DateTime? date = null)
     {
         try
         {
@@ -203,7 +220,7 @@ public class QueueService : IQueueService
     {
         try
         {
-            return await _unitOfWork.Parameters.GetValueAsync(code);
+            return await _helper.GetParameterAsync(code);
         }
         catch (Exception ex)
         {
@@ -225,6 +242,13 @@ public class QueueService : IQueueService
         }
     }
 
+    #endregion
+
+    #region AddNew Logic - Converted from BVBase
+
+    /// <summary>
+    /// Add new queue item - Logic từ BVBase.AddNew()
+    /// </summary>
     public async Task<QueueItemDto> AddNewQueueItemAsync(CreateQueueItemDto dto)
     {
         try
@@ -240,18 +264,19 @@ public class QueueService : IQueueService
             // 1. Get Queue Information
             int queueId;
             string queueName;
-            int? departmentId = null;
+            string? tenBacSi = null;
 
             if (dto.DEPARTMENT_ID > 0)
             {
                 var queue = await _unitOfWork.Queues.GetByDepartmentIdAsync(dto.DEPARTMENT_ID);
                 if (queue == null)
                 {
-                    throw new InvalidOperationException($"Queue not found for department ID: {dto.DEPARTMENT_ID}");
+                    throw new InvalidOperationException(
+                        $"Queue not found for department ID: {dto.DEPARTMENT_ID}");
                 }
                 queueId = queue.ID;
                 queueName = queue.NAME;
-                departmentId = queue.DEPARTMENT_ID;
+                tenBacSi = queue.TENBACSI;
             }
             else if (dto.QUEUE_ID.HasValue && dto.QUEUE_ID.Value > 0)
             {
@@ -262,7 +287,7 @@ public class QueueService : IQueueService
                 }
                 queueId = queue.ID;
                 queueName = queue.NAME;
-                departmentId = queue.DEPARTMENT_ID;
+                tenBacSi = queue.TENBACSI;
             }
             else
             {
@@ -272,58 +297,85 @@ public class QueueService : IQueueService
             // 2. Check if patient already has a ticket
             if (!string.IsNullOrEmpty(dto.PATIENTCODE))
             {
-                var existingItem = await _unitOfWork.QueueItems.FirstOrDefaultAsync(qi =>
-                    qi.QUEUE_ID == queueId &&
-                    qi.PATIENTCODE == dto.PATIENTCODE &&
-                    qi.CREATEDATE == createDate.Date &&
-                    (qi.STATE == 1 || qi.STATE == 0 || qi.STATE == 3 || qi.STATE == null || qi.STATE == 100));
+                var exists = await _helper.CheckPatientExistsInQueueAsync(
+                    queueId, dto.PATIENTCODE, createDate.Date);
 
-                if (existingItem != null)
+                if (exists)
                 {
-                    _logger.LogWarning("Patient {PatientCode} already has a ticket in queue {QueueId}",
+                    var existingItem = await _unitOfWork.QueueItems.GetByPatientCodeAsync(
+                        queueId, dto.PATIENTCODE, createDate.Date);
+
+                    _logger.LogWarning(
+                        "Patient {PatientCode} already has ticket in queue {QueueId}",
                         dto.PATIENTCODE, queueId);
-                    return _mapper.Map<QueueItemDto>(existingItem);
+
+                    var existingDto = _mapper.Map<QueueItemDto>(existingItem);
+                    existingDto.QueueName = queueName;
+                    return existingDto;
                 }
             }
 
             // 3. Generate Sequence Number
-            int sequence = await _unitOfWork.Queues.GetMaxSequenceAsync(queueId, createDate);
+            int sequence = await _helper.GetMaxSequenceAsync(queueId, createDate);
             sequence++;
 
-            // 4. Get Parameters
-            var prefix = await GetParameterValueAsync("Prefix") ?? "";
-            var suffix = await GetParameterValueAsync("Suffix") ?? "";
-            var lengthStr = await GetParameterValueAsync("DoDaiSTT") ?? "4";
-            int length = int.Parse(lengthStr);
+            // Check cache for max sequence
+            var cachedItems = _cacheService.GetCachedQueueItems(queueId);
+            if (cachedItems.Any())
+            {
+                var maxCached = cachedItems.Max(qi => qi.SEQUENCE ?? 0);
+                if (maxCached >= sequence)
+                {
+                    sequence = maxCached + 1;
+                }
+            }
+
+            // 4. Get Display Parameters
+            var length = await _helper.GetIntParameterAsync("DoDaiSTT", 4);
+            var prefix = await _helper.GetParameterAsync("Prefix", "False");
+            var suffix = await _helper.GetParameterAsync("Suffix", "False");
+            var remarks = await _helper.GetParameterAsync("REMARKS", "");
 
             string displayText = sequence.ToString().PadLeft(length, '0');
             string order = displayText;
             int previous = 0;
 
-            // 5. Handle Priority Queue (Insert logic)
+            // 5. Handle Priority Queue
             if (dto.PRIORITY > 0)
             {
-                order = await CalculatePriorityOrderAsync(queueId, displayText, createDate);
+                // Calculate priority sequence
+                var prioritySeq = await _helper.CalculatePrioritySequenceKhamBenhAsync(
+                    queueId, createDate);
 
-                // Extract previous sequence from order if needed
-                var priorityParam = await GetParameterValueAsync("BNUT");
-                if (!string.IsNullOrEmpty(priorityParam))
+                if (prioritySeq > 0)
                 {
-                    if (prefix == "True")
-                    {
-                        displayText = priorityParam + displayText;
-                    }
-                    else if (suffix == "True")
-                    {
-                        displayText = displayText + priorityParam;
-                    }
+                    sequence = prioritySeq;
+                    displayText = sequence.ToString().PadLeft(length, '0');
+                }
+
+                // Calculate order for insertion
+                order = await _helper.CalculateOrderForPriorityAsync(
+                    queueId, displayText, createDate);
+
+                // Add priority prefix/suffix
+                var priorityText = await _helper.GetParameterAsync("BNUT", "UT");
+                if (prefix == "True")
+                {
+                    displayText = priorityText + displayText;
+                }
+                else if (suffix == "True")
+                {
+                    displayText = displayText + priorityText;
                 }
             }
 
             // 6. Calculate Estimate Time
-            var estimateTime = await CalculateEstimateTimeAsync(queueId, createDate);
+            var estimateTime = await _helper.CalculateEstimateTimeAsync(queueId, createDate);
 
-            // 7. Create Queue Item
+            // 7. Get BenhVien_ID
+            var benhVienId = await _helper.GetParameterAsync("BenhVien_ID", "");
+
+            // 8. Create Queue Item
             var newItem = new QMS_QUEUE_ITEM
             {
                 QUEUE_ID = queueId,
@@ -343,8 +395,9 @@ public class QueueService : IQueueService
                 STATE = dto.STATE,
                 CLIENT_ID = dto.CLIENT_ID,
                 CLIENT_NAME = dto.CLIENT_NAME,
-                BENHVIEN_ID = await GetParameterValueAsync("BenhVienID"),
+                BENHVIEN_ID = benhVienId,
                 NGAYTAO = DateTime.Now,
+                REMARKS = remarks,
                 ISMATOATHUOC = dto.ISMATOATHUOC ?? 0,
                 SOTIEN = dto.SOTIEN,
                 TENCUA = dto.TENCUA
@@ -353,13 +406,37 @@ public class QueueService : IQueueService
             await _unitOfWork.QueueItems.AddAsync(newItem);
             await _unitOfWork.CommitTransactionAsync();
 
-            _logger.LogInformation("Created queue item for patient {PatientCode} in queue {QueueId}, Sequence: {Sequence}",
+            _logger.LogInformation(
+                "Created queue item for patient {PatientCode} in queue {QueueId}, Sequence: {Sequence}",
                 dto.PATIENTCODE, queueId, sequence);
 
-            var result = _mapper.Map<QueueItemDto>(newItem);
-            result.QueueName = queueName;
+            // 9. Add to Cache
+            var cacheItem = new QueueItemDto
+            {
+                ID = newItem.ID,
+                QUEUE_ID = queueId,
+                QueueName = queueName,
+                SEQUENCE = sequence,
+                DISPLAYTEXT = displayText,
+                ORDER = order,
+                PATIENTCODE = dto.PATIENTCODE,
+                PATIENTNAME = dto.PATIENTNAME,
+                PATIENTYOB = dto.PATIENTYOB,
+                PRIORITY = dto.PRIORITY,
+                STATE = dto.STATE,
+                CREATEDATE = createDate.Date,
+                CREATETIME = createDate,
+                ESTIMATETIME = estimateTime,
+                CLIENT_ID = dto.CLIENT_ID,
+                CLIENT_NAME = dto.CLIENT_NAME,
+                ISMATOATHUOC = dto.ISMATOATHUOC,
+                SOTIEN = dto.SOTIEN,
+                TENCUA = dto.TENCUA
+            };
 
-            return result;
+            _cacheService.AddQueueItemToCache(cacheItem);
+
+            return cacheItem;
         }
         catch (Exception ex)
         {
@@ -369,142 +446,132 @@ public class QueueService : IQueueService
         }
     }
 
-    // Helper method for priority order calculation
-    private async Task<string> CalculatePriorityOrderAsync(int queueId, string displayText, DateTime date)
+    /// <summary>
+    /// Add new for Tiep Nhan (Reception) - Logic từ BVBase.AddNewTiepNhan()
+    /// </summary>
+    public async Task<QueueItemDto> AddNewTiepNhanAsync(
+        int queueId,
+        int priority,
+        string patientCode)
     {
         try
         {
-            var numPriorityStr = await GetParameterValueAsync("numpriority") ?? "3";
-            int step = int.Parse(numPriorityStr);
+            await _unitOfWork.BeginTransactionAsync();
 
-            // Get waiting items (normal priority)
-            var normalItems = await _unitOfWork.QueueItems.FindAsync(qi =>
-                qi.QUEUE_ID == queueId &&
-                qi.CREATEDATE == date.Date &&
-                qi.PRIORITY == 0 &&
-                (qi.STATE == 1 || qi.STATE == 100));
+            var createDate = DateTime.Now;
 
-            var normalItemsList = normalItems.OrderByDescending(qi => qi.ORDER).ToList();
-
-            if (!normalItemsList.Any())
+            // 1. Get Queue
+            var queue = await _unitOfWork.Queues.GetByIdAsync(queueId);
+            if (queue == null)
             {
-                return displayText;
+                throw new ArgumentException($"Queue with ID {queueId} not found");
             }
 
-            // Get priority items
-            var priorityItems = await _unitOfWork.QueueItems.FindAsync(qi =>
-                qi.QUEUE_ID == queueId &&
-                qi.CREATEDATE == date.Date &&
-                qi.PRIORITY != 0 &&
-                (qi.STATE == 1 || qi.STATE == 100));
+            // 2. Generate Sequence
+            int sequence = await _helper.GetMaxSequenceAsync(queueId, createDate);
+            sequence++;
 
-            var priorityItemsList = priorityItems.OrderByDescending(qi => qi.ORDER).ToList();
-            var maxPriorityItem = priorityItemsList.FirstOrDefault();
+            // 3. Get Parameters
+            var numStart = await _helper.GetIntParameterAsync("NUMSTART", 0);
+            var length = await _helper.GetIntParameterAsync("DoDaiSTT", 4);
+            var prefix = await _helper.GetParameterAsync("Prefix", "False");
+            var suffix = await _helper.GetParameterAsync("Suffix", "False");
+            var remarks = await _helper.GetParameterAsync("REMARKS", "");
 
-            if (maxPriorityItem != null && maxPriorityItem.PREVIOUS.HasValue && maxPriorityItem.PREVIOUS.Value > 0)
+            string displayText = (numStart + sequence).ToString().PadLeft(length, '0');
+            string order = displayText;
+            int previous = 0;
+
+            // 4. Handle Priority
+            if (priority > 0)
             {
-                int previousSequence = maxPriorityItem.PREVIOUS.Value;
-                var nextItems = normalItemsList
-                    .Where(qi => qi.SEQUENCE > previousSequence)
-                    .OrderBy(qi => qi.SEQUENCE)
-                    .Take(step)
-                    .ToList();
+                order = await _helper.CalculateOrderForPriorityAsync(
+                    queueId, displayText, createDate);
 
-                if (nextItems.Any())
+                if (previous > 0)
                 {
-                    var lastItem = nextItems.Last();
-                    return lastItem.ORDER + "c";
+                    displayText = previous.ToString().PadLeft(length, '0');
                 }
-            }
-            else if (maxPriorityItem != null)
-            {
-                int previousSequence = maxPriorityItem.SEQUENCE ?? 0;
-                var nextItems = normalItemsList
-                    .Where(qi => qi.SEQUENCE > previousSequence)
-                    .OrderBy(qi => qi.SEQUENCE)
-                    .Take(step)
-                    .ToList();
 
-                if (nextItems.Any())
+                var priorityText = await _helper.GetParameterAsync("priorityKios", "UT");
+                if (prefix == "True")
                 {
-                    var lastItem = nextItems.Last();
-                    return lastItem.ORDER + "b";
+                    displayText = priorityText + displayText;
                 }
-            }
-            else
-            {
-                var minItem = normalItemsList.Last();
-                int previousSequence = minItem.SEQUENCE ?? 0;
-                var nextItem = normalItemsList
-                    .Where(qi => qi.SEQUENCE < previousSequence + step)
-                    .FirstOrDefault();
-
-                if (nextItem != null)
+                else if (suffix == "True")
                 {
-                    return nextItem.ORDER + "a";
+                    displayText = displayText + priorityText;
                 }
             }
 
-            return displayText;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error calculating priority order");
-            return displayText;
-        }
-    }
+            // 5. Calculate Estimate Time
+            var estimateTime = await _helper.CalculateEstimateTimeAsync(queueId, createDate);
 
-    // Helper method for estimate time calculation
-    private async Task<DateTime> CalculateEstimateTimeAsync(int queueId, DateTime createDate)
-    {
-        try
-        {
-            // Get time parameters
-            var startTimeParam = await GetParameterValueAsync("GIOBATDAU") ?? "7:30";
-            var startTimeParts = startTimeParam.Split(':');
-            var startTime = new TimeSpan(
-                int.Parse(startTimeParts[0]),
-                int.Parse(startTimeParts[1]),
-                0);
+            // 6. Get BenhVien_ID
+            var benhVienId = await _helper.GetParameterAsync("BenhVien_ID", "");
 
-            var estimationTime = createDate.Date.Add(startTime);
-
-            if (estimationTime < createDate)
+            // 7. Create Item
+            var newItem = new QMS_QUEUE_ITEM
             {
-                estimationTime = createDate;
-            }
+                QUEUE_ID = queueId,
+                CREATEDATE = createDate.Date,
+                CREATETIME = createDate,
+                ORDER = order,
+                SEQUENCE = sequence,
+                PATIENTCODE = patientCode,
+                PREFIX = prefix,
+                DISPLAYTEXT = displayText,
+                SUFFIX = suffix,
+                PREVIOUS = previous,
+                PRIORITY = priority,
+                STATE = 1, // Wait
+                ESTIMATETIME = estimateTime,
+                BENHVIEN_ID = benhVienId,
+                NGAYTAO = createDate,
+                REMARKS = remarks,
+                ISMATOATHUOC = 0
+            };
 
-            // Calculate waiting time based on queue
-            int waitingMinutes = await CalculateWaitingTimeAsync(queueId);
+            await _unitOfWork.QueueItems.AddAsync(newItem);
+            await _unitOfWork.CommitTransactionAsync();
 
-            return estimationTime.AddMinutes(waitingMinutes);
+            _logger.LogInformation(
+                "Created Tiep Nhan item in queue {QueueId}, Sequence: {Sequence}",
+                queueId, sequence);
+
+            // 8. Return DTO
+            var result = new QueueItemDto
+            {
+                ID = newItem.ID,
+                QUEUE_ID = queueId,
+                QueueName = queue.NAME,
+                SEQUENCE = sequence,
+                DISPLAYTEXT = displayText,
+                ORDER = order,
+                PATIENTCODE = patientCode,
+                CREATEDATE = createDate.Date,
+                CREATETIME = createDate,
+                ESTIMATETIME = estimateTime,
+                STATE = 1,
+                PRIORITY = priority,
+                REMARKS = remarks
+            };
+
+            _cacheService.AddQueueItemToCache(result);
+
+            return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error calculating estimate time");
-            return createDate;
+            await _unitOfWork.RollbackTransactionAsync();
+            _logger.LogError(ex, "Error adding Tiep Nhan item");
+            throw;
         }
     }
 
-    // Helper method for waiting time calculation
-    private async Task<int> CalculateWaitingTimeAsync(int queueId)
-    {
-        try
-        {
-            var waitingCount = await _unitOfWork.QueueItems.CountByStateAsync(queueId, 1, DateTime.Today);
+    #endregion
 
-            // Get average processing time from parameter or client
-            var clients = await _unitOfWork.Clients.GetClientsByQueueIdAsync(queueId);
-            int processDuration = clients.FirstOrDefault()?.PROCESSDURATION ?? 5; // Default 5 minutes
-
-            return waitingCount * processDuration;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error calculating waiting time");
-            return 0;
-        }
-    }
+    #region Queue Operations
 
     public async Task<QueueItemDto?> GetNextQueueItemAsync(int queueId, int clientId, string clientName)
     {
@@ -514,29 +581,23 @@ public class QueueService : IQueueService
 
             var today = DateTime.Today;
 
-            // 1. Check if there's already a processing item
+            // Check if there's already a processing item
             var processingItem = await _unitOfWork.QueueItems.FirstOrDefaultAsync(qi =>
                 qi.QUEUE_ID == queueId &&
-                qi.STATE == 0 && // Process
+                qi.STATE == 0 &&
                 (qi.CLIENT_ID == 0 || qi.CLIENT_ID == clientId) &&
                 qi.CREATEDATE == today);
 
             if (processingItem != null)
             {
-                _logger.LogInformation("Found existing processing item for queue {QueueId}, client {ClientId}",
+                _logger.LogInformation(
+                    "Found existing processing item for queue {QueueId}, client {ClientId}",
                     queueId, clientId);
                 return _mapper.Map<QueueItemDto>(processingItem);
             }
 
-            // 2. Get next waiting item
-            var nextItem = await _unitOfWork.QueueItems.FirstOrDefaultAsync(qi =>
-                qi.QUEUE_ID == queueId &&
-                qi.CREATEDATE == today &&
-                qi.STATE != 3 && // Not Miss
-                qi.STATE != 100 && // Not None
-                qi.STATE != 0 && // Not Process
-                qi.STATE != 4 && // Not Remove
-                qi.STATE != 2); // Not Done
+            // Get next waiting item
+            var nextItem = await _unitOfWork.QueueItems.GetNextWaitingItemAsync(queueId);
 
             if (nextItem == null)
             {
@@ -544,8 +605,8 @@ public class QueueService : IQueueService
                 return null;
             }
 
-            // 3. Update item to processing state
-            nextItem.STATE = 0; // Process
+            // Update to processing
+            nextItem.STATE = 0;
             nextItem.PROCESSTIME = DateTime.Now;
             nextItem.CLIENT_ID = clientId;
             nextItem.CLIENT_NAME = clientName;
@@ -553,7 +614,8 @@ public class QueueService : IQueueService
             _unitOfWork.QueueItems.Update(nextItem);
             await _unitOfWork.CommitTransactionAsync();
 
-            _logger.LogInformation("Assigned queue item {ItemId} to client {ClientId}",
+            _logger.LogInformation(
+                "Assigned queue item {ItemId} to client {ClientId}",
                 nextItem.ID, clientId);
 
             return _mapper.Map<QueueItemDto>(nextItem);
@@ -567,11 +629,11 @@ public class QueueService : IQueueService
     }
 
     public async Task<bool> UpdateQueueItemStateAsync(
-    int queueId,
-    string displayText,
-    int state,
-    string? clientName = null,
-    int? isMaToaThuoc = null)
+        int queueId,
+        string displayText,
+        int state,
+        string? clientName = null,
+        int? isMaToaThuoc = null)
     {
         try
         {
@@ -579,7 +641,6 @@ public class QueueService : IQueueService
 
             var today = DateTime.Today;
 
-            // Find the item
             var item = await _unitOfWork.QueueItems.FirstOrDefaultAsync(qi =>
                 qi.QUEUE_ID == queueId &&
                 qi.DISPLAYTEXT == displayText &&
@@ -588,27 +649,26 @@ public class QueueService : IQueueService
 
             if (item == null)
             {
-                _logger.LogWarning("Queue item not found: Queue {QueueId}, Display {DisplayText}",
+                _logger.LogWarning(
+                    "Queue item not found: Queue {QueueId}, Display {DisplayText}",
                     queueId, displayText);
                 return false;
             }
 
-            // Check if already done
             if (item.STATE == 2)
             {
                 _logger.LogInformation("Queue item {ItemId} is already done", item.ID);
                 return true;
             }
 
-            // Update state
             item.STATE = state;
             item.CLIENT_NAME = clientName;
 
-            if (state == 0) // Process
+            if (state == 0)
             {
                 item.PROCESSTIME = DateTime.Now;
             }
-            else if (state == 2) // Done
+            else if (state == 2)
             {
                 item.FINISHTIME = DateTime.Now;
             }
@@ -629,11 +689,11 @@ public class QueueService : IQueueService
     }
 
     public async Task<bool> UpdateQueueItemStateByPatientCodeAsync(
-    int queueId,
-    string patientCode,
-    int state,
-    string? clientName = null,
-    bool recall = false)
+        int queueId,
+        string patientCode,
+        int state,
+        string? clientName = null,
+        bool recall = false)
     {
         try
         {
@@ -641,20 +701,12 @@ public class QueueService : IQueueService
 
             var today = DateTime.Today;
 
-            // Get recall parameter
-            bool recallShowDisplay = false;
-            var recallParam = await GetParameterValueAsync("RecallShowDisplay");
-            if (!string.IsNullOrEmpty(recallParam))
-            {
-                bool.TryParse(recallParam, out recallShowDisplay);
-            }
+            var recallShowDisplay = await _helper.GetBoolParameterAsync("RecallShowDisplay", false);
 
-            // Find items based on recall setting
             IEnumerable<QMS_QUEUE_ITEM> items;
 
             if (recall && recallShowDisplay)
             {
-                // Get all items including done
                 items = await _unitOfWork.QueueItems.FindAsync(qi =>
                     qi.QUEUE_ID == queueId &&
                     qi.PATIENTCODE == patientCode &&
@@ -662,33 +714,32 @@ public class QueueService : IQueueService
             }
             else
             {
-                // Get only non-done items
                 items = await _unitOfWork.QueueItems.FindAsync(qi =>
                     qi.QUEUE_ID == queueId &&
                     qi.PATIENTCODE == patientCode &&
                     qi.CREATEDATE == today &&
-                    qi.STATE != 2); // Not Done
+                    qi.STATE != 2);
             }
 
             var itemsList = items.ToList();
             if (!itemsList.Any())
             {
-                _logger.LogWarning("No queue items found for patient {PatientCode} in queue {QueueId}",
+                _logger.LogWarning(
+                    "No queue items found for patient {PatientCode} in queue {QueueId}",
                     patientCode, queueId);
                 return false;
             }
 
-            // Update all found items
             foreach (var item in itemsList)
             {
                 item.STATE = state;
                 item.CLIENT_NAME = clientName;
 
-                if (state == 0) // Process
+                if (state == 0)
                 {
                     item.PROCESSTIME = DateTime.Now;
                 }
-                else if (state == 2) // Done
+                else if (state == 2)
                 {
                     item.FINISHTIME = DateTime.Now;
                 }
@@ -698,7 +749,8 @@ public class QueueService : IQueueService
 
             await _unitOfWork.CommitTransactionAsync();
 
-            _logger.LogInformation("Updated {Count} queue items for patient {PatientCode} to state {State}",
+            _logger.LogInformation(
+                "Updated {Count} queue items for patient {PatientCode} to state {State}",
                 itemsList.Count, patientCode, state);
 
             return true;
@@ -719,10 +771,9 @@ public class QueueService : IQueueService
 
             var today = DateTime.Today;
 
-            // Find all missed items
             var missedItems = await _unitOfWork.QueueItems.FindAsync(qi =>
                 qi.QUEUE_ID == queueId &&
-                qi.STATE == 3 && // Miss
+                qi.STATE == 3 &&
                 qi.CREATEDATE == today);
 
             var missedItemsList = missedItems.ToList();
@@ -733,10 +784,9 @@ public class QueueService : IQueueService
                 return true;
             }
 
-            // Reset missed items to waiting
             foreach (var item in missedItemsList)
             {
-                item.STATE = 1; // Wait
+                item.STATE = 1;
                 item.CLIENT_ID = 0;
                 item.CLIENT_NAME = null;
                 _unitOfWork.QueueItems.Update(item);
@@ -744,7 +794,8 @@ public class QueueService : IQueueService
 
             await _unitOfWork.CommitTransactionAsync();
 
-            _logger.LogInformation("Cleared {Count} missed items for queue {QueueId}",
+            _logger.LogInformation(
+                "Cleared {Count} missed items for queue {QueueId}",
                 missedItemsList.Count, queueId);
 
             return true;
@@ -758,11 +809,11 @@ public class QueueService : IQueueService
     }
 
     public async Task<bool> MoveQueueItemAsync(
-    int fromQueueId,
-    string order,
-    int toQueueId,
-    string patientCode,
-    int? departmentId = null)
+        int fromQueueId,
+        string order,
+        int toQueueId,
+        string patientCode,
+        int? departmentId = null)
     {
         try
         {
@@ -770,7 +821,6 @@ public class QueueService : IQueueService
 
             var today = DateTime.Today;
 
-            // Find the original item
             var originalItem = await _unitOfWork.QueueItems.FirstOrDefaultAsync(qi =>
                 qi.QUEUE_ID == fromQueueId &&
                 qi.ORDER == order &&
@@ -783,11 +833,8 @@ public class QueueService : IQueueService
                 return false;
             }
 
-            // Calculate waiting time for new queue
-            int waitingMinutes = await CalculateWaitingTimeAsync(toQueueId);
-            var estimateTime = await CalculateEstimateTimeAsync(toQueueId, DateTime.Now);
+            var estimateTime = await _helper.CalculateEstimateTimeAsync(toQueueId, DateTime.Now);
 
-            // Create new item in target queue
             var newItem = new QMS_QUEUE_ITEM
             {
                 QUEUE_ID = toQueueId,
@@ -813,7 +860,8 @@ public class QueueService : IQueueService
             await _unitOfWork.QueueItems.AddAsync(newItem);
             await _unitOfWork.CommitTransactionAsync();
 
-            _logger.LogInformation("Moved queue item from queue {FromQueue} to {ToQueue} for patient {PatientCode}",
+            _logger.LogInformation(
+                "Moved queue item from queue {FromQueue} to {ToQueue} for patient {PatientCode}",
                 fromQueueId, toQueueId, patientCode);
 
             return true;

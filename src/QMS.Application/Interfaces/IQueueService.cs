@@ -28,4 +28,5 @@ public interface IQueueService
     // Parameter Management
     Task<string?> GetParameterValueAsync(string code);
     Task<Dictionary<string, string>> GetAllParametersAsync();
+    Task<QueueItemDto> AddNewTiepNhanAsync(int queueId, int priority, string patientCode);
 }
