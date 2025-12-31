@@ -1,6 +1,7 @@
 ﻿using Asp.Versioning;
 using Microsoft.AspNetCore.Mvc;
 using QMS.Application.Interfaces;
+using QMS.Core.Enums;
 
 namespace QMS.API.Controllers.V1;
 
@@ -91,6 +92,60 @@ public class CacheController : BaseApiController
         {
             _cacheService.ClearQueueItemsCache();
             return Success("Queue items cache cleared");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error clearing queue items cache");
+            return InternalServerError("Failed to clear cache");
+        }
+    }
+
+    /// <summary>
+    /// Clear queue items cache
+    /// </summary>
+    [HttpGet("cache-count")]
+    public IActionResult GetCacheStatistics(int type)
+    {
+        try
+        {
+            var rtn = _cacheService.GetCacheStatistics(type);
+            return Success(rtn);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error clearing queue items cache");
+            return InternalServerError("Failed to clear cache");
+        }
+    }
+
+    /// <summary>
+    /// Clear queue items cache
+    /// </summary>
+    [HttpGet("value")]
+    public IActionResult GetValueOfParameter(string code)
+    {
+        try
+        {
+            var rtn = _cacheService.GetValueOfParameter(code);
+            return Success(rtn);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error clearing queue items cache");
+            return InternalServerError("Failed to clear cache");
+        }
+    }
+
+    /// <summary>
+    /// Clear queue items cache
+    /// </summary>
+    [HttpGet("clear-queue")]
+    public IActionResult ClearCacheByType(CacheType type)
+    {
+        try
+        {
+            var rtn = _cacheService.ClearCacheByType(type);
+            return Success(rtn);
         }
         catch (Exception ex)
         {

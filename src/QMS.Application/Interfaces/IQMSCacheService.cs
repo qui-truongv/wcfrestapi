@@ -2,6 +2,8 @@
 using QMS.Application.DTOs.Queue;
 using QMS.Application.DTOs.Screen;
 using QMS.Core.Entities;
+using QMS.Core.Enums;
+using System.Security.AccessControl;
 
 namespace QMS.Application.Interfaces;
 
@@ -37,4 +39,8 @@ public interface IQMSCacheService
     // Statistics
     int GetCachedItemsCount();
     DateTime GetLastReloadTime();
+
+    object GetCacheStatistics(int type);
+    string GetValueOfParameter(string code, string defaultValue = "");
+    bool ClearCacheByType(CacheType type);
 }

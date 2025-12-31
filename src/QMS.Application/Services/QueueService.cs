@@ -875,4 +875,33 @@ public class QueueService : IQueueService
     }
 
     #endregion
+
+    public List<QueueItemDto> GetQueueItemsByQueue(int queueId, int? take = null)
+    {
+        try
+        {
+            var queueItems = _cacheService.GetCachedItemsCount() > 0
+                ? _cacheService.GetCachedQueueItems(queueId)
+                : new List<QueueItemDto>();
+
+            // 2. Lọc và Sắp xếp
+            // Code cũ dùng q.State != Status.None, giả sử Status.None = 0 hoặc -1 (đã hủy)
+            var query = queueItems
+                .Where(q => q.STATE != -1)
+                .OrderBy(q => q.ORDER);
+
+            // 3. Xử lý lấy số lượng giới hạn (nếu có)
+            if (take.HasValue && take.Value > 0)
+            {
+                return query.Take(take.Value).ToList();
+            }
+
+            return query.ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Lỗi khi lấy danh sách QueueItem cho Queue: {QueueId}", queueId);
+            return new List<QueueItemDto>();
+        }
+    }
 }

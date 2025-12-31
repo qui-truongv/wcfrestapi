@@ -501,7 +501,27 @@ public class QueueController : BaseApiController
         }
     }
 
+
+    /// <summary>
+    /// Get all parameters
+    /// </summary>
+    [HttpGet("Items-Queue")]
+    [ProducesResponseType(typeof(ApiResponse<Dictionary<string, string>>), StatusCodes.Status200OK)]
+    public async Task<IActionResult> GetQueueItemsByQueue(int queueId, int? take)
+    {
+        try
+        {
+            var rtn = await _queueService.GetQueueItemsByQueue(queueId, take);
+            return Success(rtn);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting all parameters");
+            return InternalServerError("Failed to retrieve parameters");
+        }
+    }
     #endregion
+
 }
 
 #region Request DTOs

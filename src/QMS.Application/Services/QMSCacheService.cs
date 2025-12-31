@@ -4,6 +4,7 @@ using QMS.Application.DTOs.Client;
 using QMS.Application.DTOs.Queue;
 using QMS.Application.DTOs.Screen;
 using QMS.Application.Interfaces;
+using QMS.Core.Enums;
 using QMS.Core.Interfaces;
 using System.Collections.Concurrent;
 
@@ -422,5 +423,119 @@ public class QMSCacheService : IQMSCacheService
         }
     }
 
+    public object GetCacheStatistics(int type)
+    {
+        return type switch
+        {
+            1 => new { Type = "QueueItems", Count = GetCachedItemsCount() },
+            2 => new { Type = "Queues", Count = _queuesCache.Count },
+            3 => new { Type = "Screens", Count = _screensCache.Count },
+            4 => new { Type = "Parameters", Count = _parametersCache.Count },
+            _ => new
+            {
+                QueueItems = GetCachedItemsCount(),
+                Queues = _queuesCache.Count,
+                Screens = _screensCache.Count,
+                Clients = _clientsCache.Count,
+                Parameters = _parametersCache.Count,
+                LastReload = _lastReloadTime
+            }
+        };
+    }
+
+    public string GetValueOfParameter(string code, string defaultValue = "")
+    {
+        // Kiểm tra cache đã được nạp chưa
+        if (_parametersCache.IsEmpty)
+        {
+            _logger.LogWarning("Parameter cache is empty when accessing key: {Key}", code);
+            return defaultValue;
+        }
+
+        // TryGetValue giúp tránh exception và không cần dùng Find (duyệt list)
+        if (_parametersCache.TryGetValue(code, out var value))
+        {
+            return value;
+        }
+
+        _logger.LogDebug("Parameter key {Key} not found in cache. Returning default: {Default}", code, defaultValue);
+
+        // Thay vì trả về "9" cứng nhắc như code cũ, chúng ta cho phép truyền defaultValue
+        // Nếu bạn muốn giữ nguyên logic cũ của hệ thống, hãy truyền "9" vào parameter defaultValue
+        return defaultValue;
+    }
+
+    public bool ClearCacheByType(CacheType type)
+    {
+        try
+        {
+            _logger.LogWarning("Yêu cầu xóa Cache được kích hoạt cho loại: {Type}", type);
+
+            switch (type)
+            {
+                case CacheType.QueueItem:
+                    _queueItemsCache.Clear();
+                    break;
+                case CacheType.Queue:
+                    _queuesCache.Clear();
+                    break;
+                case CacheType.Screen:
+                    _screensCache.Clear();
+                    break;
+                case CacheType.Parameter:
+                    _parametersCache.Clear();
+                    break;
+                case CacheType.All:
+                    _queueItemsCache.Clear();
+                    _queuesCache.Clear();
+                    _screensCache.Clear();
+                    _clientsCache.Clear();
+                    _parametersCache.Clear();
+                    break;
+                default:
+                    _logger.LogError("Loại Cache không hợp lệ để xóa: {Type}", type);
+                    return false;
+            }
+
+            _logger.LogInformation("Đã xóa trắng Cache loại {Type} thành công.", type);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Lỗi xảy ra khi cố gắng xóa Cache loại {Type}", type);
+            return false;
+        }
+    }
+
+    public List<QueueItemDto> GetQueueItemsByQueue(int queueId, int? take = null)
+    {
+        try
+        {
+            // 1. Lấy danh sách từ Cache theo QueueId (Đã được phân loại trong ConcurrentDictionary)
+            if (!_queueItemsCache.TryGetValue(queueId, out var items))
+            {
+                return new List<QueueItemDto>();
+            }
+
+            // 2. Lọc và Sắp xếp
+            // Code cũ dùng q.State != Status.None, giả sử Status.None = 0 hoặc -1 (đã hủy)
+            var query = items
+                .Where(q => q.STATE != -1)
+                .OrderBy(q => q.ORDER);
+
+            // 3. Xử lý lấy số lượng giới hạn (nếu có)
+            if (take.HasValue && take.Value > 0)
+            {
+                return query.Take(take.Value).ToList();
+            }
+
+            return query.ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Lỗi khi lấy danh sách QueueItem cho Queue: {QueueId}", queueId);
+            return new List<QueueItemDto>();
+        }
+    }
     #endregion
 }
